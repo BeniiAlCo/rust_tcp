@@ -59,4 +59,6 @@ TUN/TAP will let us create a fake network interface that we can use to send info
 
 Because our implementation here will give us the raw bytes that the kernel sends to our NIC, and we want to recive IP addresses, we will also have to implement the Internet Protocol (thought this should be relatively straightforward !)
 
+### etherparse
 
+The focus of this project is the implementation of TCP/IP, not the parsing of network packets, so we can rely on already existing crates to do the parsing for us !
