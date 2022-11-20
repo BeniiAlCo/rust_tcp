@@ -5,6 +5,23 @@ enum ConnectionState {
     //Listen,
     SynRcvd,
     Estab,
+    FinWait1,
+    FinWait2,
+    Closing,
+    TimeWait,
+}
+
+impl ConnectionState {
+    fn is_synchronized(&self) -> bool {
+        match *self {
+            ConnectionState::SynRcvd => false,
+            ConnectionState::Estab => true,
+            ConnectionState::FinWait1 => true,
+            ConnectionState::FinWait2 => true,
+            ConnectionState::Closing => true,
+            ConnectionState::TimeWait => true,
+        }
+    }
 }
 
 pub struct TcpState {
@@ -12,6 +29,7 @@ pub struct TcpState {
     send: SendSequence,
     recieve: RecieveSequence,
     ip: etherparse::Ipv4Header,
+    tcp: etherparse::TcpHeader,
 }
 
 // the send sequence space is the list of positions of the data we have sent
@@ -64,6 +82,7 @@ impl TcpState {
             // returning a SYN,ACK packet
 
             let iss = 0;
+            let wnd = 8;
             let mut connection = TcpState {
                 connection_state: ConnectionState::SynRcvd,
                 recieve: RecieveSequence {
@@ -75,8 +94,8 @@ impl TcpState {
                 send: SendSequence {
                     iss,
                     una: iss,
-                    nxt: iss + 1,
-                    wnd: 8,
+                    nxt: iss,
+                    wnd,
                     up: false,
                     wl1: 0,
                     wl2: 0,
@@ -98,67 +117,88 @@ impl TcpState {
                         ip_header.source()[3],
                     ],
                 ),
+                tcp: etherparse::TcpHeader::new(destination_port, source_port, iss, wnd),
             };
-
-            // construct the headers
-            let outgoing_source_port = destination_port;
-            let outgoing_destination_port = source_port;
-            let _outgoing_sequence_number = 0;
-            let _outgoing_window_size = 8;
 
             // keep track of sender info
 
             // establish what it is we will be sending back
 
             // need to start establishing a connection
-            let mut syn_ack = etherparse::TcpHeader::new(
-                outgoing_source_port,
-                outgoing_destination_port,
-                connection.send.iss,
-                connection.send.wnd,
-            );
-            syn_ack.acknowledgment_number = connection.recieve.nxt;
-            syn_ack.syn = true;
-            syn_ack.ack = true;
-            let bytes_length = 0;
-            connection
-                .ip
-                .set_payload_len(syn_ack.header_len() as usize + bytes_length)
-                .expect("payload length value is too big");
 
-            // the kernel does the checksum for us !
-            //syn_ack.checksum = syn_ack
-            //   .calc_checksum_ipv4(&ip, &[])
-            //    .expect("failed to compute checksum");
+            //connection.tcp.acknowledgment_number = connection.recieve.nxt;
+            connection.tcp.syn = true;
+            connection.tcp.ack = true;
 
-            // write the headers to a buffer, then send everything written, and exclude any
-            // empty part of the buffer
-            let unwritten = {
-                let mut unwritten = &mut buf[..];
-                connection.ip.write(&mut unwritten).ok();
-                syn_ack.write(&mut unwritten).ok();
-                unwritten.len()
-            };
-            //eprintln!("{:02x?}", &buf[..buf.len() - unwritten]);
-            nic.send(&buf[..buf.len() - unwritten])?;
+            connection.write(nic, &[])?;
+
             Ok(Some(connection))
         }
 
         // eprintln!("{source_address}:{source_port} -> {destination_address}:{destination_port} {payload_size}b of tcp");
     }
 
+    fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> io::Result<usize> {
+        let mut buf = [0u8; 1500];
+        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.acknowledgment_number = self.recieve.nxt;
+
+        let size = std::cmp::min(
+            buf.len(),
+            self.tcp.header_len() as usize + self.ip.header_len() + payload.len(),
+        );
+        self.ip.set_payload_len(size - self.ip.header_len());
+
+        // the kernel does the checksum for us !
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &[])
+            .expect("failed to compute checksum");
+
+        // write the headers to a buffer, then send everything written, and exclude any
+        // empty part of the buffer
+
+        use std::io::Write;
+        let mut unwritten = &mut buf[..];
+        self.ip.write(&mut unwritten);
+        self.tcp.write(&mut unwritten);
+        let payload_bytes = unwritten.write(payload)?;
+        let unwritten = unwritten.len();
+
+        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
+        if self.tcp.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+        if self.tcp.fin {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.fin = false;
+        }
+
+        //eprintln!("{:02x?}", &buf[..buf.len() - unwritten]);
+
+        nic.send(&buf[..buf.len() - unwritten])?;
+        Ok(payload_bytes)
+    }
+
+    pub fn snd_rst(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
+        self.tcp.rst = true;
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.write(nic, &[])?;
+        Ok(())
+    }
+
     pub fn on_packet<'a>(
         &mut self,
-        _nic: &mut tun_tap::Iface,
+        nic: &mut tun_tap::Iface,
         _ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
         data: &'a [u8],
     ) -> io::Result<()> {
         // acceptable ack check (RFC 793 S3.3)
         // SND.UNA < SEG.ACK =< SND.NXT (but it wraps !)
-        let una = self.send.una;
-        let ack = tcp_header.acknowledgment_number();
-        let nxt = self.send.nxt;
+
         let mut slen = data.len();
         if tcp_header.fin() {
             slen += 1
@@ -167,54 +207,122 @@ impl TcpState {
             slen += 1
         };
 
-        if !(una < ack && (ack <= nxt || (ack >= nxt && una > nxt)) || ack <= nxt && una > nxt) {
-            return Ok(());
-        };
-
         // valid segment check
         // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         let nxt = self.recieve.nxt;
         let seq = tcp_header.sequence_number();
         let end = self.recieve.nxt.wrapping_add(self.recieve.wnd as u32);
-        let seq_end = tcp_header.sequence_number() + slen as u32 - 1;
+        let seq_end = tcp_header.sequence_number().wrapping_add(slen as u32 - 1);
 
-        if slen == 0 {
+        let okay = if slen == 0 {
             //zero-length segment rules
             if self.recieve.wnd == 0 {
                 if seq != self.recieve.nxt {
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
             } else if !(nxt <= seq && (seq < end || (seq > end && nxt > end))
                 || seq < end && nxt > end)
             {
-                return Ok(());
+                false
+            } else {
+                true
             }
         } else if self.recieve.wnd == 0
             || !(nxt <= seq_end && (seq_end < end || (seq_end > end && nxt > end))
                 || seq_end < end && nxt > end)
         {
+            false
+        } else {
+            true
+        };
+
+        if !okay {
+            self.write(nic, &[])?;
+            return Ok(());
+        }
+        self.recieve.nxt = tcp_header.sequence_number().wrapping_add(slen as u32);
+        // TODO: we've gotta ACK this !
+
+        if !tcp_header.ack() {
             return Ok(());
         }
 
-        match self.connection_state {
-            //ConnectionState::Closed => todo!(),
-            //ConnectionState::Listen => todo!(),
-            ConnectionState::SynRcvd => {
-                // if we're in this state, we're going to expect to receive an ACK for a SYN we
-                // have previously sent
-
-                if !tcp_header.ack() {
-                    return Ok(());
-                }
-
+        //self.tcp.fin = true;
+        //self.write(nic, &[])?;
+        //self.connection_state = ConnectionState::FinWait1;
+        let una = self.send.una;
+        let ack = tcp_header.acknowledgment_number();
+        if let ConnectionState::SynRcvd = self.connection_state {
+            if (una <= ack && (ack <= nxt || (ack >= nxt && una > nxt)) || ack <= nxt && una > nxt)
+            {
                 self.connection_state = ConnectionState::Estab;
-
-                // now we can terminate the connection !
-            }
-            ConnectionState::Estab => {
-                unimplemented!()
+            } else {
+                // reset
             }
         }
+
+        if let ConnectionState::Estab | ConnectionState::FinWait1 | ConnectionState::FinWait2 =
+            self.connection_state
+        {
+            let nxt = self.send.nxt;
+
+            if !(una < ack && (ack <= nxt || (ack >= nxt && una > nxt)) || ack <= nxt && una > nxt)
+            {
+                //if !self.connection_state.is_synchronized() {
+                // send reset, as per spec
+                // self.send.nxt = tcp_header.acknowledgment_number();
+                //    self.snd_rst(nic)?;
+                //}
+                return Ok(());
+            };
+
+            self.send.una = tcp_header.acknowledgment_number();
+
+            assert!(data.is_empty());
+
+            if let ConnectionState::Estab = self.connection_state {
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+                self.connection_state = ConnectionState::FinWait1;
+            }
+        }
+
+        if let ConnectionState::FinWait1 = self.connection_state {
+            if self.send.una == self.send.iss + 2 {
+                // our fin has been ack'd
+
+                // they must have ack'd our fin ! (it's all that we have sent)
+                self.connection_state = ConnectionState::FinWait2;
+            }
+        }
+
+        if tcp_header.fin() {
+            match self.connection_state {
+                ConnectionState::SynRcvd => unimplemented!(),
+                ConnectionState::Estab => unimplemented!(),
+                ConnectionState::FinWait1 => unimplemented!(),
+                ConnectionState::FinWait2 => {
+                    // we're done
+                    self.write(nic, &[])?;
+                    self.connection_state = ConnectionState::TimeWait;
+                }
+                ConnectionState::Closing => unimplemented!(),
+                ConnectionState::TimeWait => unimplemented!(),
+            }
+        }
+
+        // if let ConnectionState::FinWait2 = self.connection_state {
+        //     if !tcp_header.fin() || !data.is_empty() {
+        //         unimplemented!()
+        //     }
+
+        //     self.tcp.fin = false;
+        //      self.write(nic, &[])?;
+        //      self.connection_state = ConnectionState::Closing;
+        //  }
+
         Ok(())
     }
 }
