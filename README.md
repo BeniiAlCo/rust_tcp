@@ -182,3 +182,163 @@ There are conventions to determine how many bits are dedicated to each part, and
 #### Names
 
 Names can be used as aliases for addresses.
+
+@NanoRaptor@bitbang.social## The TCP Handshake
+```
+
+                              +---------+ ---------\      active OPEN
+                              |  CLOSED |            \    -----------
+                              +---------+<---------\   \   create TCB
+                                |     ^              \   \  snd SYN
+                   passive OPEN |     |   CLOSE        \   \
+                   ------------ |     | ----------       \   \
+                    create TCB  |     | delete TCB         \   \
+                                V     |                      \   \
+                              +---------+            CLOSE    |    \
+                              |  LISTEN |          ---------- |     |
+                              +---------+          delete TCB |     |
+                   rcv SYN      |     |     SEND              |     |
+                  -----------   |     |    -------            |     V
+ +---------+      snd SYN,ACK  /       \   snd SYN          +---------+
+ |         |<-----------------           ------------------>|         |
+ |   SYN   |                    rcv SYN                     |   SYN   |
+ |   RCVD  |<-----------------------------------------------|   SENT  |
+ |         |                    snd ACK                     |         |
+ |         |------------------           -------------------|         |
+ +---------+   rcv ACK of SYN  \       /  rcv SYN,ACK       +---------+
+   |           --------------   |     |   -----------
+   |                  x         |     |     snd ACK
+   |                            V     V
+   |  CLOSE                   +---------+
+   | -------                  |  ESTAB  |
+   | snd FIN                  +---------+
+   |                  a CLOSE    |     |    rcv FIN
+   V                  -------   |     |    -------
+ +---------+          snd FIN  /       \   snd ACK          +---------+
+ |  FIN    |<-----------------           ------------------>|  CLOSE  |
+ | WAIT-1  |------------------                              |   WAIT  |
+ +---------+          rcv FIN  \                            +---------+
+   | rcv ACK of FIN   -------   |                            CLOSE  |
+   | --------------   snd ACK   |                           ------- |
+   V        x                   V                           snd FIN V
+ +---------+                  +---------+                   +---------+
+ |FINWAIT-2|                  | CLOSING |                   | LAST-ACK|
+ +---------+                  +---------+                   +---------+
+   |                rcv ACK of FIN |                 rcv ACK of FIN |
+   |  rcv FIN       -------------- |    Timeout=2MSL -------------- |
+   |  -------              x       V    ------------        x       V
+    \ snd ACK                 +---------+delete TCB         +---------+
+     ------------------------>|TIME WAIT|------------------>| CLOSED  |
+                              +---------+                   +---------+
+
+from https://www.rfc-editor.org/rfc/rfc793#section-2.2
+```
+
+### Initial implementation
+
+Once we're at a point where we have a program that can receive a tcp syn packet, there are a few things we need to do.
+For now we will assume only one incoming connection (and that there are no malicious actors !).
+
+First, we need to make sure that the program knows that the packets it receives are tcp syn packets.
+Then, we need to follow the diagram above to establish a connection.
+If we are in the LISTEN state, and we receive SYN, then we send SYN,ACK.
+This then moves us to SYN RCVD, where we wait for the other host to send us an ACK of our SYN.
+
+So, our first steps are to establish that we have indeed received a SYN packet, and to then return a SYN,ACK packet.
+
+### A quick primer on the structure of a TCP Packet, and how to make one
+
+```
+  TCP Header Format
+
+
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |          Source Port          |       Destination Port        |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                        Sequence Number                        |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                    Acknowledgment Number                      |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |  Data |           |U|A|P|R|S|F|                               |
+   | Offset| Reserved  |R|C|S|S|Y|I|            Window             |
+   |       |           |G|K|H|T|N|N|                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |           Checksum            |         Urgent Pointer        |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                    Options                    |    Padding    |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                             data                              |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+* Source Port: Source Port Number 
+* Destination Port: Destination Port Number
+* Sequence Number: The sequence number of the first data octet (if syn is present, the sequence number is instead the initial sequence number (ISN), and we know that the first data octet is then the ISN+1)
+* Acknowledgment Number: If the ACK control bit is set, the acknowledgment number is the next sequence number the sender of the segment is expecting to receive. Once a connection is established, this is always sent.
+* Data Offset: The number of 32 bit words in the TCP header -- indicates where the data begins
+* Reserved: Must be zero
+* Control bits:
+    * URG: Urgent Pointer field Significant
+    * ACK: Acknowledgment field Significant
+    * PSH: Push Function 
+    * RST: Reset the Connection 
+    * SYN: Synchronize Seqence numbers
+    * FIN: No more data from sender 
+* Window: Number of data octets, starting with the one indicated in the acknowledgment field, that the sender of this segment is willing to accept
+* Checksum: 
+* Urgent Pointer: The current pointer as a positive offset from the sequence number in this segment (requires the URG control bit set)
+* Options: Either a single octet containing option data, or one octet of option-kind, one octet of option-length (which include the kind and length octets), and the actual octets of option-data.
+* Padding: To ensure that the TCP header ends, and the data begins on a 32 bit boundary, the header may end with a series of zeros.
+
+To maintain a TCP connection, several variables need to be maintained.
+We can think of these variables being stored together in a TCB (Transmission Control Block).
+
+Send Sequence Variables
+
+      SND.UNA - send unacknowledged
+      SND.NXT - send next
+      SND.WND - send window
+      SND.UP  - send urgent pointer
+      SND.WL1 - segment sequence number used for last window update
+      SND.WL2 - segment acknowledgment number used for last window update
+      ISS     - initial send sequence number
+
+Receive Sequence Variables
+
+      RCV.NXT - receive next
+      RCV.WND - receive window
+      RCV.UP  - receive urgent pointer
+      IRS     - initial receive sequence numbers
+
+```
+Send Sequence Space
+
+                   1         2          3          4
+              ----------|----------|----------|----------
+                     SND.UNA    SND.NXT    SND.UNA
+                                          +SND.WND
+
+        1 - old sequence numbers which have been acknowledged
+        2 - sequence numbers of unacknowledged data
+        3 - sequence numbers allowed for new data transmission
+        4 - future sequence numbers which are not yet allowed
+```
+
+```
+  Receive Sequence Space
+
+                       1          2          3
+                   ----------|----------|----------
+                          RCV.NXT    RCV.NXT
+                                    +RCV.WND
+
+        1 - old sequence numbers which have been acknowledged
+        2 - sequence numbers allowed for new reception
+        3 - future sequence numbers which are not yet allowed
+```
+
+
+
+
