@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::Ipv4Addr;
 
+mod network_parse;
 mod tcp;
 
 type Port = u16;
