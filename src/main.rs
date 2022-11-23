@@ -17,7 +17,7 @@ struct Quad {
 fn main() -> io::Result<()> {
     let mut connections: HashMap<Quad, TcpState> = Default::default();
 
-    let mut nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+    let mut nic = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
     let mut buf = vec![0u8; 1504];
 
     loop {
@@ -25,13 +25,36 @@ fn main() -> io::Result<()> {
         // if we get the tun interface with packet info, need to strip leading 4 bits, and then add
         // them pack on when sending a packet
         //
-        //let _flags = u16::from_be_bytes([buf[0], buf[1]]);
+        //let flags = u16::from_be_bytes([buf[0], buf[1]]);
         //let proto = u16::from_be_bytes([buf[2], buf[3]]);
+
         //
         // // no non-ipv4
         //if proto != 0x0800 {
         //    continue;
         //}
+
+        let input = &buf[..nbytes];
+        match network_parse::TunTapHeader::from_slice(input) {
+            Ok(tun_header) => {
+                //eprintln!("tun_header:{tun_header:?}");
+
+                if let Some(network_parse::Protocol::Ipv4) = tun_header.protocol {
+                    match network_parse::parse_ipv4(&input[4..]) {
+                        Ok((remaining, valid_ipv4_header)) => {
+                            eprintln!("ipv4_header:{valid_ipv4_header:?}");
+                            eprintln!("remaining:{remaining:?}");
+                        }
+                        Err(_) => {
+                            eprintln!("something went wrong");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("something went wrong");
+            }
+        }
 
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
             Ok(ip_header) => {
@@ -97,8 +120,8 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-            Err(err) => {
-                eprintln!("ignoring weird packet {err:?}");
+            Err(_) => {
+                eprintln!(" ");
             }
         }
     }
