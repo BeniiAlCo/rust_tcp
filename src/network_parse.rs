@@ -28,6 +28,7 @@ pub enum Protocol {
 
 impl TunTapHeader {
     pub fn from_slice(slice: &[u8]) -> Result<TunTapHeader, Box<dyn std::error::Error>> {
+        // CHECK
         // Is the slice big enough to hold the header?
         assert!(slice.len() >= 2);
 
@@ -42,6 +43,7 @@ impl TunTapHeader {
             let (_, protocol) = parse_protocol(input).unwrap();
             Some(protocol)
         };
+
         // Seems fine!
         Ok(TunTapHeader { flags, protocol })
     }
@@ -109,6 +111,71 @@ pub struct IPv4Header {
     destination_address: Ipv4Addr,
     //options: Option<u32>,
     //padding: Option<u32>,
+}
+
+impl IPv4Header {
+    pub fn from_slice(slice: &[u8]) -> Result<IPv4Header, Box<dyn std::error::Error>> {
+        // CHECK
+        // Is the slice big enough to hold the minimum-sized header?
+        assert!(slice.len() >= 30);
+
+        // Version & IHL
+        let (input, (version, ihl)) = parse_version_ihl(slice).unwrap();
+
+        // CHECK
+        // Is the version 4?
+        assert!(version == 4);
+
+        // CHECK
+        // Is the IHL too small?
+        assert!(ihl >= 5);
+
+        // CHECK
+        // Is the slice big enough to fit all of the data the IHL indicates?
+        assert!(slice.len() >= (ihl as usize * 4));
+
+        // Type of Service
+        let (input, type_of_service) = parse_type_of_service(input).unwrap();
+
+        // Total Length
+        let (input, total_length) = parse_total_length(input).unwrap();
+
+        // CHECK
+        // Is the total length indicated big enough to fit all of the data the IHL indicates?
+        assert!(total_length >= (ihl as u16 * 4));
+
+        // Identification
+
+        // Flags
+
+        // Fragment Offset
+
+        // Time to Live
+
+        // Protocol
+
+        // Header Checksum
+
+        // Source Address
+
+        // Destination Address
+
+        unimplemented!()
+    }
+}
+
+fn parse_version_ihl(input: &[u8]) -> IResult<&[u8], (u8, u8)> {
+    let (input, (version, ihl)) = take_4b_twice(input).unwrap();
+
+    Ok((input, (version, ihl)))
+}
+
+fn parse_type_of_service(input: &[u8]) -> IResult<&[u8], u8> {
+    take_8b(input)
+}
+
+fn parse_total_length(input: &[u8]) -> IResult<&[u8], u16> {
+    take_16b(input)
 }
 
 pub fn parse_ipv4(input: &[u8]) -> IResult<&[u8], IPv4Header> {
@@ -182,6 +249,17 @@ pub fn parse_ipv4(input: &[u8]) -> IResult<&[u8], IPv4Header> {
             destination_address,
         },
     ))
+}
+
+fn take_4b_twice(input: &[u8]) -> IResult<&[u8], (u8, u8)> {
+    bits::<&[u8], (u8, u8), Error<(&[u8], usize)>, Error<&[u8]>, _>(tuple((
+        take(4usize),
+        take(4usize),
+    )))(input)
+}
+
+fn take_8b(input: &[u8]) -> IResult<&[u8], u8> {
+    bits::<&[u8], u8, Error<(&[u8], usize)>, Error<&[u8]>, _>(take(8usize))(input)
 }
 
 fn take_16b(input: &[u8]) -> IResult<&[u8], u16> {
